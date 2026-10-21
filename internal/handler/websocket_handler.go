@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,10 +11,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/time/rate"
 
 	"github.com/armin-meh82/live-chat/internal/chat"
 	"github.com/armin-meh82/live-chat/internal/dto"
+	"github.com/armin-meh82/live-chat/internal/ratelimit"
 	"github.com/armin-meh82/live-chat/internal/service"
 )
 
@@ -27,16 +28,19 @@ const (
 type WebSocketHandler struct {
 	hub         *chat.Hub
 	chatService *service.ChatService
+	limiter     *ratelimit.RedisLimiter
 	upgrader    websocket.Upgrader
 }
 
 func NewWebSocketHandler(
 	hub *chat.Hub,
 	chatService *service.ChatService,
+	limiter *ratelimit.RedisLimiter,
 ) *WebSocketHandler {
 	return &WebSocketHandler{
 		hub:         hub,
 		chatService: chatService,
+		limiter:     limiter,
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -101,8 +105,6 @@ func (h *WebSocketHandler) readPump(client *chat.Client) {
 		return client.Conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
-	limiter := rate.NewLimiter(rate.Limit(5), 10)
-
 	for {
 		messageType, data, err := client.Conn.ReadMessage()
 		if err != nil {
@@ -116,17 +118,33 @@ func (h *WebSocketHandler) readPump(client *chat.Client) {
 			continue
 		}
 
-		if !limiter.Allow() {
-			if !sendError(client, "rate limit exceeded") {
+		var incoming dto.IncomingMessageDTO
+		if err := json.Unmarshal(data, &incoming); err != nil {
+			if !sendError(client, "invalid JSON message") {
 				return
 			}
 			continue
 		}
 
-		var incoming dto.IncomingMessageDTO
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			2*time.Second,
+		)
 
-		if err := json.Unmarshal(data, &incoming); err != nil {
-			if !sendError(client, "invalid JSON message") {
+		allowed, err := h.limiter.Allow(ctx, client.UserID)
+		cancel()
+
+		if err != nil {
+			log.Printf("redis rate limiter failed: %v", err)
+			_ = sendError(client, "rate limiter unavailable")
+			return
+		}
+
+		if !allowed {
+			if !sendError(
+				client,
+				"rate limit exceeded: maximum 5 messages per 20 seconds",
+			) {
 				return
 			}
 			continue
@@ -137,7 +155,7 @@ func (h *WebSocketHandler) readPump(client *chat.Client) {
 			client.UserID,
 			incoming,
 		); err != nil {
-			if !sendError(client, "invalid message") {
+			if !sendError(client, "invalid message or message could not be saved") {
 				return
 			}
 		}
@@ -146,7 +164,6 @@ func (h *WebSocketHandler) readPump(client *chat.Client) {
 
 func (h *WebSocketHandler) writePump(client *chat.Client) {
 	ticker := time.NewTicker(pingPeriod)
-
 	defer func() {
 		ticker.Stop()
 		_ = client.Conn.Close()
@@ -155,7 +172,9 @@ func (h *WebSocketHandler) writePump(client *chat.Client) {
 	for {
 		select {
 		case message, ok := <-client.Send:
-			if err := client.Conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+			if err := client.Conn.SetWriteDeadline(
+				time.Now().Add(writeWait),
+			); err != nil {
 				return
 			}
 

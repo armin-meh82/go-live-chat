@@ -13,7 +13,10 @@ func TestProcessMessageValidation(t *testing.T) {
 	hub.Register(client)
 	defer hub.Unregister(client)
 
-	chatService := NewChatService(hub)
+	chatService := NewChatService(
+		hub,
+		&fakeMessageRepository{},
+	)
 
 	tests := []struct {
 		name    string

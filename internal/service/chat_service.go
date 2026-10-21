@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/armin-meh82/live-chat/internal/chat"
 	"github.com/armin-meh82/live-chat/internal/dto"
+	"github.com/armin-meh82/live-chat/internal/repository"
 )
 
 var (
@@ -19,11 +21,18 @@ var (
 )
 
 type ChatService struct {
-	hub *chat.Hub
+	hub  *chat.Hub
+	repo repository.MessageRepository
 }
 
-func NewChatService(hub *chat.Hub) *ChatService {
-	return &ChatService{hub: hub}
+func NewChatService(
+	hub *chat.Hub,
+	repo repository.MessageRepository,
+) *ChatService {
+	return &ChatService{
+		hub:  hub,
+		repo: repo,
+	}
 }
 
 func (s *ChatService) ProcessMessage(
@@ -35,15 +44,9 @@ func (s *ChatService) ProcessMessage(
 		return ErrInvalidRoomID
 	}
 
-	if incoming.Type != "chat.message" {
-		return ErrInvalidMessage
-	}
-
-	if strings.TrimSpace(incoming.Message) == "" {
-		return ErrInvalidMessage
-	}
-
-	if utf8.RuneCountInString(incoming.Message) > 500 {
+	if incoming.Type != "chat.message" ||
+		strings.TrimSpace(incoming.Message) == "" ||
+		utf8.RuneCountInString(incoming.Message) > 500 {
 		return ErrInvalidMessage
 	}
 
@@ -59,6 +62,16 @@ func (s *ChatService) ProcessMessage(
 		Type:    incoming.Type,
 		Message: incoming.Message,
 		SentAt:  time.Now().UTC(),
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		3*time.Second,
+	)
+	defer cancel()
+
+	if err := s.repo.Save(ctx, message); err != nil {
+		return err
 	}
 
 	data, err := json.Marshal(message)

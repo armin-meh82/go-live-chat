@@ -10,31 +10,72 @@ import (
 	"time"
 
 	"github.com/armin-meh82/live-chat/cmd/config"
-
-	"github.com/joho/godotenv"
-
 	"github.com/armin-meh82/live-chat/internal/chat"
+	"github.com/armin-meh82/live-chat/internal/database"
 	"github.com/armin-meh82/live-chat/internal/handler"
+	"github.com/armin-meh82/live-chat/internal/ratelimit"
+	"github.com/armin-meh82/live-chat/internal/repository"
 	"github.com/armin-meh82/live-chat/internal/service"
+	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-
 	if err := godotenv.Load(".env"); err != nil {
-		log.Println("Warning: .env file not found")
+		log.Println("Warning: .env file not found; using environment variables")
 	}
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatal("config loading failed:", err)
+		log.Fatal("config loading failed: ", err)
+	}
+
+	db, err := database.OpenPostgres(cfg.DatabaseURL)
+	if err != nil {
+		log.Fatal("postgres connection failed: ", err)
+	}
+
+	sqlDB, err := db.DB()
+	if err != nil {
+		log.Fatal("get postgres connection failed: ", err)
+	}
+	defer sqlDB.Close()
+
+	redisOptions, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		log.Fatal("invalid REDIS_URL: ", err)
+	}
+
+	redisClient := redis.NewClient(redisOptions)
+	defer redisClient.Close()
+
+	startupCtx, startupCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer startupCancel()
+
+	if err := redisClient.Ping(startupCtx).Err(); err != nil {
+		log.Fatal("redis connection failed: ", err)
 	}
 
 	hub := chat.NewHub()
 
-	chatService := service.NewChatService(hub)
+	messageRepo := repository.NewGormMessageRepository(db)
+	chatService := service.NewChatService(hub, messageRepo)
 	roomService := service.NewRoomService(hub)
 
-	wsHandler := handler.NewWebSocketHandler(hub, chatService)
+	limiter := ratelimit.NewRedisLimiter(
+		redisClient,
+		5,
+		20*time.Second,
+	)
+
+	wsHandler := handler.NewWebSocketHandler(
+		hub,
+		chatService,
+		limiter,
+	)
 	httpHandler := handler.NewHTTPHandler(hub, roomService)
 
 	mux := http.NewServeMux()
@@ -56,6 +97,7 @@ func main() {
 
 	go func() {
 		log.Printf("server listening on http://localhost:%s", cfg.ServerPort)
+
 		serverErrors <- server.ListenAndServe()
 	}()
 
